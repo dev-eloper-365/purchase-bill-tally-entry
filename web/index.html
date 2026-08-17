@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Purchase Bill Tally Entry</title>
+<script>
+  // Runs before first paint so there is no flash of the wrong theme.
+  // Cycle is System -> Light -> Dark -> System; "System" (no stored
+  // choice) is the default and tracks prefers-color-scheme live.
+  (function () {
+    var stored = localStorage.getItem('theme'); // 'light' | 'dark' | null (= system)
+    var mode = stored === 'light' || stored === 'dark' ? stored : 'system';
+    var resolved = mode === 'system'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      : mode;
+    document.documentElement.setAttribute('data-theme-mode', mode);
+    document.documentElement.setAttribute('data-theme', resolved);
+  })();
+</script>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header>
+  <h1>Purchase Bill &rarr; Tally Entry</h1>
+  <div class="header-right">
+    <select id="companySelect" class="company-select" title="Active Tally company - click Test connection to list all open companies"></select>
+    <span class="env-badge local" id="envBadge">LOCAL</span>
+    <button id="themeToggle" class="icon-btn" type="button" title="Theme: System"></button>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>1. Connection &amp; masters</h2>
+    <div class="row-flex">
+      <button id="btnTestConnection">Test connection</button>
+      <button id="btnCheckMasters">Check required masters (safe, one-by-one)</button>
+      <button id="btnLoadLedgers">Load ledgers for matching (full company export - confirms first)</button>
+      <span id="connStatus" class="small-dim"></span>
+    </div>
+    <div id="mastersResult" style="margin-top:10px;"></div>
+  </section>
+
+  <section class="panel">
+    <h2>2. Upload bills</h2>
+    <div id="dropZone" class="drop-zone">
+      Drop PDF bills here, or click to choose files
+      <input id="fileInput" type="file" accept="application/pdf" multiple class="hidden" />
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>3. Review &amp; verify</h2>
+    <div class="row-flex" style="margin-bottom:10px;">
+      <button id="btnRunPreflight" class="primary">Run preflight (validate, no writes)</button>
+      <button id="btnClearAll">Clear all rows</button>
+      <span id="preflightStatus" class="small-dim"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="billsTable">
+        <thead>
+          <tr>
+            <th class="col-expand"></th>
+            <th class="col-file">File</th>
+            <th>Status</th>
+            <th>Supplier (from bill)</th>
+            <th>Ledger (Tally)</th>
+            <th>Invoice No</th>
+            <th>Date</th>
+            <th>Vehicle / Narration</th>
+            <th>Qty</th>
+            <th>Rate</th>
+            <th>TCS 2%</th>
+            <th>Total</th>
+            <th class="col-flags"></th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody id="billsTbody"></tbody>
+      </table>
+    </div>
+    <datalist id="ledgersDatalist"></datalist>
+  </section>
+
+  <section class="panel">
+    <h2>4. Send to Tally</h2>
+    <div class="row-flex">
+      <button id="btnSendAll" class="primary">Send all ready rows, one at a time</button>
+      <span id="sendStatus" class="small-dim"></span>
+    </div>
+    <div id="serverConfirmBox"></div>
+    <h2 style="margin-top:16px;">Activity log</h2>
+    <div id="logBox" class="log-box"></div>
+  </section>
+</main>
+
+<script src="theme.js"></script>
+<script src="vendor/pdf.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
+</script>
+<script src="extract.js"></script>
+<script src="tally.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

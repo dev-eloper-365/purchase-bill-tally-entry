@@ -1,0 +1,5 @@
+# Real purchase bills - GSTINs, bank account numbers, invoice amounts
+Bill_Samples/
+
+# Real Tally request/response logs from testing - contains real financial data
+logs/

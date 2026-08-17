@@ -1,0 +1,6 @@
+{
+  "environment": "LOCAL",
+  "tallyUrl": "http://localhost:9000",
+  "companyName": "DELTA GLOBAL PRIVATE LIMITED GJ 2025-26",
+  "bridgePort": 8765
+}
