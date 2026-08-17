@@ -57,6 +57,7 @@ async function init() {
   document.getElementById('btnCheckMasters').addEventListener('click', checkMasters);
   document.getElementById('btnLoadLedgers').addEventListener('click', loadLedgers);
   document.getElementById('btnRunPreflight').addEventListener('click', runPreflight);
+  document.getElementById('btnRemoveSelected').addEventListener('click', removeSelected);
   document.getElementById('btnClearAll').addEventListener('click', clearAll);
   document.getElementById('btnSendAll').addEventListener('click', onSendAllClicked);
 
@@ -78,6 +79,10 @@ async function init() {
   document.getElementById('billsTbody').addEventListener('input', onTableInput);
   document.getElementById('billsTbody').addEventListener('change', onTableInput);
   document.getElementById('billsTbody').addEventListener('click', onTableClick);
+  document.getElementById('selectAllRows').addEventListener('change', (e) => {
+    for (const row of bills) row.selected = e.target.checked;
+    renderTable();
+  });
 
   log('Ready. Bridge target: ' + CONFIG.tallyUrl + ' / company: ' + CONFIG.companyName);
 }
@@ -235,6 +240,8 @@ async function handleFiles(fileList) {
       expanded: false,
       rawText: '',
       showRawText: false,
+      selected: false,
+      dirty: false,
     };
     bills.push(row);
     renderTable();
@@ -290,6 +297,21 @@ function clearAll() {
   log('Cleared all rows.');
 }
 
+function removeSelected() {
+  const selected = bills.filter((b) => b.selected);
+  if (selected.length === 0) {
+    log('No rows selected - check a row via its checkbox first.');
+    return;
+  }
+  if (selected.some((b) => b.status === 'sending')) {
+    alert('A send is in progress on one of the selected rows - wait for it to finish.');
+    return;
+  }
+  bills = bills.filter((b) => !b.selected);
+  renderTable();
+  log(`Removed ${selected.length} selected row(s).`);
+}
+
 // ---- table rendering ------------------------------------------------------
 
 function escapeHtml(s) {
@@ -297,8 +319,10 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// Indian-style comma grouping (4,42,262.00), matching how amounts are
+// printed on the bills themselves.
 function fmt(n) {
-  return n == null || Number.isNaN(n) ? '' : n.toFixed(2);
+  return n == null || Number.isNaN(n) ? '' : n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function fmtDateDisplay(iso) {
@@ -319,6 +343,49 @@ function ellipsisCell(value, extraClass) {
 function renderTable() {
   const tbody = document.getElementById('billsTbody');
   tbody.innerHTML = bills.map((row) => renderRow(row) + (row.expanded ? renderDetailRow(row) : '')).join('');
+}
+
+// Replaces just one row's <tr> (and its detail <tr>, if open) in place -
+// used by the Update button so committing an edit refreshes that row's
+// collapsed cells and its own computed-tax card without rebuilding the
+// whole table (which would disrupt every other row's state/scroll).
+function htmlToRowNodes(html) {
+  const tmp = document.createElement('tbody');
+  tmp.innerHTML = html;
+  return Array.from(tmp.children);
+}
+
+function patchRowDom(id) {
+  const row = findRow(id);
+  if (!row) return;
+  const tbody = document.getElementById('billsTbody');
+  const mainTr = tbody.querySelector(`tr[data-row-id="${id}"]`);
+  const detailTr = tbody.querySelector(`tr.detail-row[data-detail-for="${id}"]`);
+
+  const newMain = htmlToRowNodes(renderRow(row))[0];
+  if (mainTr) {
+    mainTr.replaceWith(newMain);
+  } else {
+    tbody.appendChild(newMain);
+  }
+
+  if (row.expanded) {
+    const newDetail = htmlToRowNodes(renderDetailRow(row))[0];
+    if (detailTr) {
+      detailTr.replaceWith(newDetail);
+    } else {
+      newMain.after(newDetail);
+    }
+  } else if (detailTr) {
+    detailTr.remove();
+  }
+}
+
+function commitRowUpdate(id) {
+  const row = findRow(id);
+  if (!row) return;
+  row.dirty = false;
+  patchRowDom(id);
 }
 
 // A real <select> dropdown of the GSTIN-matched Tally ledgers (the
@@ -361,7 +428,6 @@ function renderLedgerCell(row, locked) {
 }
 
 function renderRow(row) {
-  const locked = row.status === 'sending' || row.status === 'sent';
   const c = row.computed || {};
   // Bills vary on which total they print: some (Agarwal) print the exact
   // unrounded sum with no round-off line at all; others (Honestfalcon, MP
@@ -383,22 +449,23 @@ function renderRow(row) {
     : '';
 
   const supplierText = row.supplierLabel || row.supplierGSTIN || '';
+  const statusLabel = STATUS_LABEL[row.status] || row.status;
 
-  return `<tr data-row-id="${row.id}" class="${row.expanded ? 'row-expanded' : ''}">
-    <td class="col-expand"><button class="chevron" data-action="toggle" data-id="${row.id}" title="${row.expanded ? 'Hide' : 'Show'} details and edit fields">${row.expanded ? '&#9662;' : '&#9656;'}</button></td>
+  return `<tr data-row-id="${row.id}" class="${row.expanded ? 'row-expanded' : ''} ${row.selected ? 'row-selected' : ''}">
     <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}</td>
-    <td><span class="badge ${row.status}">${STATUS_LABEL[row.status] || row.status}</span></td>
     ${supplierText ? ellipsisCell(supplierText, 'col-supplier') : '<td><span class="diff-flag">unknown</span></td>'}
     ${ellipsisCell(row.ledgerName, 'col-ledger')}
     ${ellipsisCell(row.invoiceNo, 'col-invno')}
     <td>${row.invoiceDate ? fmtDateDisplay(row.invoiceDate) : '<span class="small-dim">—</span>'}</td>
     ${ellipsisCell(row.vehicleNo, 'col-vehicle')}
-    <td class="col-total">${row.qty != null ? row.qty : '<span class="small-dim">—</span>'}</td>
+    <td class="col-total">${row.qty != null ? fmt(row.qty) : '<span class="small-dim">—</span>'}</td>
     <td class="col-total">${row.rate != null ? fmt(row.rate) : '<span class="small-dim">—</span>'}</td>
     <td class="small-dim col-total">${fmt(c.tcs)}</td>
     <td class="col-total">${totalHtml}</td>
     <td class="col-flags">${flagHtml}</td>
-    <td class="col-actions"><button class="small" data-id="${row.id}" data-action="remove" ${locked ? 'disabled' : ''}>&times;</button></td>
+    <td class="col-status"><span class="status-dot ${row.status}" title="${escapeHtml(statusLabel)}"></span></td>
+    <td class="col-select"><input class="row-select" type="checkbox" data-id="${row.id}" data-action="select-row" ${row.selected ? 'checked' : ''} /></td>
+    <td class="col-expand"><button class="chevron" data-action="toggle" data-id="${row.id}" title="${row.expanded ? 'Hide' : 'Show'} details and edit fields">${row.expanded ? '&#9652;' : '&#9662;'}</button></td>
   </tr>`;
 }
 
@@ -407,79 +474,96 @@ function renderDetailRow(row) {
   const c = row.computed || {};
   const notes = [...(row.warnings || []), ...(row.errors || [])];
   const notesHtml = notes.length
-    ? notes.map((w) => `<div class="detail-note">${escapeHtml(w)}</div>`).join('')
-    : '<div class="small-dim">No warnings.</div>';
+    ? `<div class="context-notes">${notes.map((w) => `<div class="detail-note">${escapeHtml(w)}</div>`).join('')}</div>`
+    : '';
+  const formula =
+    row.qty != null && row.rate != null
+      ? `<div class="calc-row-formula"><span>${fmt(row.qty)} MTS &times; ${fmt(row.rate)}</span><span class="calc-eq">=</span><span>${fmt(c.taxable)}</span></div>`
+      : '';
 
   return `<tr class="detail-row" data-detail-for="${row.id}">
-    <td></td>
     <td colspan="12">
-      <div class="detail-grid">
-        <div class="detail-block detail-edit">
-          <div class="detail-label">Ledger</div>
-          ${renderLedgerCell(row, locked)}
-        </div>
-        <div class="detail-block detail-edit">
-          <div class="detail-label">Invoice No</div>
-          <input data-id="${row.id}" data-field="invoiceNo" value="${escapeHtml(row.invoiceNo)}" ${locked ? 'disabled' : ''} />
-        </div>
-        <div class="detail-block detail-edit">
-          <div class="detail-label">Date</div>
-          <input type="date" data-id="${row.id}" data-field="invoiceDate" value="${escapeHtml(row.invoiceDate)}" ${locked ? 'disabled' : ''} />
-        </div>
-        <div class="detail-block detail-edit">
-          <div class="detail-label">Vehicle / Narration</div>
-          <input data-id="${row.id}" data-field="vehicleNo" value="${escapeHtml(row.vehicleNo)}" ${locked ? 'disabled' : ''} />
-        </div>
-        <div class="detail-block detail-edit">
-          <div class="detail-label">Qty (MTS)</div>
-          <input type="number" step="0.001" data-id="${row.id}" data-field="qty" value="${row.qty ?? ''}" ${locked ? 'disabled' : ''} />
-        </div>
-        <div class="detail-block detail-edit">
-          <div class="detail-label">Rate</div>
-          <input type="number" step="0.01" data-id="${row.id}" data-field="rate" value="${row.rate ?? ''}" ${locked ? 'disabled' : ''} />
-        </div>
-      </div>
-      <div class="detail-grid" style="margin-top:16px;">
-        <div class="detail-block">
-          <div class="detail-label">Supplier</div>
-          <div>${escapeHtml(row.supplierGSTIN) || '<span class="small-dim">GSTIN not detected</span>'}</div>
-          ${row.supplierLabel ? `<div class="small-dim">${escapeHtml(row.supplierLabel)}</div>` : ''}
-        </div>
-        <div class="detail-block">
-          <div class="detail-label">Computed tax (used for the voucher)</div>
-          <table class="mini-table">
-            <tr><td>Taxable</td><td>${fmt(c.taxable)}</td></tr>
-            <tr><td>CGST 9%</td><td>${fmt(c.cgst)}</td></tr>
-            <tr><td>SGST 9%</td><td>${fmt(c.sgst)}</td></tr>
-            <tr><td>TCS 2%</td><td>${fmt(c.tcs)}</td></tr>
-            <tr><td>Round off</td><td>${fmt(c.roundOff)}</td></tr>
-            <tr class="mini-total"><td>Total</td><td>${fmt(c.total)}</td></tr>
-          </table>
-        </div>
-        <div class="detail-block">
-          <div class="detail-label">Printed on bill</div>
-          <div>${row.printedTotal != null ? fmt(row.printedTotal) : '<span class="small-dim">not parsed</span>'}</div>
-        </div>
-        <div class="detail-block detail-notes">
-          <div class="detail-label">Notes</div>
+      <div class="detail-content-wrap">
+        <div class="detail-top-context">
+          <div class="context-supplier">${escapeHtml(row.supplierLabel || 'Supplier not identified')} <span class="small-dim">${escapeHtml(row.supplierGSTIN) || 'GSTIN not detected'}</span></div>
           ${notesHtml}
         </div>
+        <div class="detail-panels">
+          <div class="detail-card detail-card-edit">
+            <div class="detail-card-title">Edit</div>
+            <div class="edit-fields-grid">
+              <div class="field field-wide">
+                <label class="detail-label">Ledger</label>
+                ${renderLedgerCell(row, locked)}
+              </div>
+              <div class="field">
+                <label class="detail-label">Invoice No</label>
+                <input data-id="${row.id}" data-field="invoiceNo" value="${escapeHtml(row.invoiceNo)}" ${locked ? 'disabled' : ''} />
+              </div>
+              <div class="field">
+                <label class="detail-label">Date</label>
+                <input type="date" data-id="${row.id}" data-field="invoiceDate" value="${escapeHtml(row.invoiceDate)}" ${locked ? 'disabled' : ''} />
+              </div>
+              <div class="field field-wide">
+                <label class="detail-label">Vehicle / Narration</label>
+                <textarea rows="2" data-id="${row.id}" data-field="vehicleNo" oninput="this.style.height='';this.style.height=this.scrollHeight+'px'" ${locked ? 'disabled' : ''}>${escapeHtml(row.vehicleNo)}</textarea>
+              </div>
+              <div class="field field-wide qty-rate-group">
+                <label class="detail-label">Qty (MTS) &times; Rate</label>
+                <div class="qty-rate-inputs">
+                  <input type="number" step="0.001" data-id="${row.id}" data-field="qty" value="${row.qty ?? ''}" ${locked ? 'disabled' : ''} />
+                  <span class="op">&times;</span>
+                  <input type="number" step="0.01" data-id="${row.id}" data-field="rate" value="${row.rate ?? ''}" ${locked ? 'disabled' : ''} />
+                </div>
+              </div>
+            </div>
+            <div class="update-row-btn-wrap">
+              <button class="primary update-row-btn" data-id="${row.id}" data-action="update-row" ${row.dirty && !locked ? '' : 'disabled'}>Update</button>
+            </div>
+          </div>
+          <div class="detail-card detail-card-summary">
+            <div class="detail-card-title">Computed for voucher</div>
+            ${formula}
+            <table class="mini-table">
+              <tr><td>CGST 9%</td><td>${fmt(c.cgst)}</td></tr>
+              <tr><td>SGST 9%</td><td>${fmt(c.sgst)}</td></tr>
+              <tr><td>TCS 2%</td><td>${fmt(c.tcs)}</td></tr>
+              <tr><td>Round off</td><td>${fmt(c.roundOff)}</td></tr>
+              <tr class="mini-total"><td>Total</td><td>${fmt(c.total)}</td></tr>
+            </table>
+            <div class="printed-compare-row">
+              <span>Printed on bill</span>
+              <span class="amt">${row.printedTotal != null ? fmt(row.printedTotal) : 'not parsed'}</span>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:18px;">
+          <button class="raw-toggle-btn" data-id="${row.id}" data-action="toggle-raw">${row.showRawText ? 'Hide' : 'Show'} raw extracted text</button>
+        </div>
+        ${
+          row.showRawText
+            ? `<textarea class="raw-text-box" readonly onclick="this.select()">${escapeHtml(row.rawText || '(no text extracted)')}</textarea>`
+            : ''
+        }
       </div>
-      <div style="margin-top:10px;">
-        <button class="small" data-id="${row.id}" data-action="toggle-raw">${row.showRawText ? 'Hide' : 'Show'} raw extracted text</button>
-      </div>
-      ${
-        row.showRawText
-          ? `<textarea class="raw-text-box" readonly onclick="this.select()">${escapeHtml(row.rawText || '(no text extracted)')}</textarea>`
-          : ''
-      }
     </td>
+    <td></td>
     <td></td>
   </tr>`;
 }
 
 function onTableInput(e) {
   const id = Number(e.target.dataset.id);
+
+  if (e.target.dataset.action === 'select-row') {
+    const row = findRow(id);
+    if (row) {
+      row.selected = e.target.checked;
+      renderTable();
+    }
+    return;
+  }
+
   const field = e.target.dataset.field;
   if (!id || !field) return;
   const row = findRow(id);
@@ -512,12 +596,19 @@ function onTableInput(e) {
     row.status = 'needs_review';
     row.errors = [];
   }
-  // Qty/Rate live in the expanded detail row and drive the Total/TCS
-  // display, but re-rendering on every keystroke ('input') would replace
-  // the input's DOM node and kick focus out mid-type. Only re-render on
-  // 'change' (blur / commit), so typing stays uninterrupted and totals
-  // refresh once the value is settled.
-  if ((field === 'qty' || field === 'rate') && e.type === 'change') renderTable();
+
+  // Edits to any of the six edit-card fields land in the row model
+  // immediately (so preflight/send always see the latest values), but the
+  // VISIBLE collapsed-row cells and the detail panel's own computed-tax
+  // card only refresh once "Update" is clicked - re-rendering on every
+  // keystroke would replace the input's DOM node and kick focus out
+  // mid-type. Just flip the button from grey to active here, with a
+  // direct (non-rendering) DOM write so typing stays uninterrupted.
+  if (!row.dirty) {
+    row.dirty = true;
+    const updateBtn = document.querySelector(`.update-row-btn[data-id="${id}"]`);
+    if (updateBtn) updateBtn.disabled = false;
+  }
 }
 
 function onTableClick(e) {
@@ -526,10 +617,7 @@ function onTableClick(e) {
   const id = Number(btn.dataset.id);
   const row = findRow(id);
 
-  if (btn.dataset.action === 'remove') {
-    bills = bills.filter((b) => b.id !== id);
-    renderTable();
-  } else if (btn.dataset.action === 'toggle') {
+  if (btn.dataset.action === 'toggle') {
     if (row) {
       row.expanded = !row.expanded;
       renderTable();
@@ -547,6 +635,8 @@ function onTableClick(e) {
       }
       renderTable();
     }
+  } else if (btn.dataset.action === 'update-row') {
+    commitRowUpdate(id);
   }
 }
 

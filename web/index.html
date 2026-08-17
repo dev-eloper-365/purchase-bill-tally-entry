@@ -54,6 +54,7 @@
     <h2>3. Review &amp; verify</h2>
     <div class="row-flex" style="margin-bottom:10px;">
       <button id="btnRunPreflight" class="primary">Run preflight (validate, no writes)</button>
+      <button id="btnRemoveSelected">Remove selected</button>
       <button id="btnClearAll">Clear all rows</button>
       <span id="preflightStatus" class="small-dim"></span>
     </div>
@@ -61,9 +62,7 @@
       <table id="billsTable">
         <thead>
           <tr>
-            <th class="col-expand"></th>
             <th class="col-file">File</th>
-            <th>Status</th>
             <th>Supplier (from bill)</th>
             <th>Ledger (Tally)</th>
             <th>Invoice No</th>
@@ -74,7 +73,9 @@
             <th>TCS 2%</th>
             <th>Total</th>
             <th class="col-flags"></th>
-            <th class="col-actions"></th>
+            <th class="col-status">Status</th>
+            <th class="col-select"><input type="checkbox" id="selectAllRows" title="Select all" /></th>
+            <th class="col-expand"></th>
           </tr>
         </thead>
         <tbody id="billsTbody"></tbody>
