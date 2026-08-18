@@ -428,8 +428,11 @@ function extractOcr(text) {
   out.vehicleNo = m ? m[1].toUpperCase() : null;
 
   // Qty/Rate: "<qty> MT ... <rate> MT" anywhere, tolerant of stray
-  // [ ] | characters OCR picks up from table borders.
-  m = text.match(/([\d.]{2,10})\s*\|?\s*MT\s*[\[\|]?\s*([\d.,]{4,15})\s*\|?\s*MT/i);
+  // [ ] | characters OCR picks up from table borders - confirmed two real
+  // OCR runs of the same bill put a stray character in different spots
+  // (one used "|" before the second MT, another used "]"), so every
+  // junction accepts any of them rather than one hardcoded choice.
+  m = text.match(/([\d.]{2,10})[\[\]\|\s]*MT[\[\]\|\s]*([\d.,]{4,15})[\[\]\|\s]*MT/i);
   if (m) {
     out.qty = stripCommas(m[1]);
     out.rate = stripCommas(m[2]);

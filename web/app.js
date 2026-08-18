@@ -16,8 +16,8 @@ const STATUS_LABEL = {
   duplicate: 'duplicate',
   sending: 'sending…',
   sent: 'sent',
-  failed: 'failed',
-  error: 'error',
+  failed: 'send failed',
+  error: 'extraction failed',
 };
 
 function log(msg, level = 'info') {
@@ -444,7 +444,46 @@ function renderLedgerCell(row, locked) {
   </select>`;
 }
 
+function skeletonCell(extraClass) {
+  return `<td class="${extraClass || ''}"><span class="skeleton"></span></td>`;
+}
+
 function renderRow(row) {
+  const statusLabel = STATUS_LABEL[row.status] || row.status;
+
+  if (row.status === 'extracting') {
+    // Nothing is known yet - showing "unknown"/dashes in every cell reads
+    // like extraction already ran and failed. Skeleton placeholders make
+    // "still loading" visually obvious instead.
+    return `<tr data-row-id="${row.id}">
+    <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}</td>
+    ${skeletonCell('col-supplier')}
+    ${skeletonCell('col-ledger')}
+    ${skeletonCell('col-invno')}
+    ${skeletonCell()}
+    ${skeletonCell('col-vehicle')}
+    <td class="col-total">${'<span class="skeleton skeleton-narrow"></span>'}</td>
+    <td class="col-total">${'<span class="skeleton skeleton-narrow"></span>'}</td>
+    <td class="col-total">${'<span class="skeleton skeleton-narrow"></span>'}</td>
+    <td class="col-total">${'<span class="skeleton skeleton-narrow"></span>'}</td>
+    <td class="col-flags"></td>
+    <td class="col-status"><span class="status-dot ${row.status}" title="${escapeHtml(statusLabel)}"></span></td>
+    <td class="col-select"><input class="row-select" type="checkbox" disabled /></td>
+    <td class="col-expand"><button class="chevron" disabled title="Still extracting…">&#9662;</button></td>
+  </tr>`;
+  }
+
+  if (row.status === 'error') {
+    return `<tr data-row-id="${row.id}" class="${row.expanded ? 'row-expanded' : ''}">
+    <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}</td>
+    <td colspan="9" class="extraction-failed-cell">Extraction failed - expand for details</td>
+    <td class="col-flags"></td>
+    <td class="col-status"><span class="status-dot ${row.status}" title="${escapeHtml(statusLabel)}"></span></td>
+    <td class="col-select"><input class="row-select" type="checkbox" data-id="${row.id}" data-action="select-row" ${row.selected ? 'checked' : ''} /></td>
+    <td class="col-expand"><button class="chevron" data-action="toggle" data-id="${row.id}" title="${row.expanded ? 'Hide' : 'Show'} details">${row.expanded ? '&#9652;' : '&#9662;'}</button></td>
+  </tr>`;
+  }
+
   const c = row.computed || {};
   // Bills vary on which total they print: some (Agarwal) print the exact
   // unrounded sum with no round-off line at all; others (Honestfalcon, MP
@@ -466,7 +505,6 @@ function renderRow(row) {
     : '';
 
   const supplierText = row.supplierLabel || row.supplierGSTIN || '';
-  const statusLabel = STATUS_LABEL[row.status] || row.status;
   const ocrTag =
     row.extractionMethod === 'ocr'
       ? '<span class="ocr-tag" title="Extracted via OCR (scanned image, no embedded text) - accuracy is lower, verify carefully">OCR</span>'

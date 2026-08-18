@@ -8,7 +8,8 @@ logs/
 # via `npm install` in tools/, not meant to be committed
 tools/node_modules/
 
-# Scratch output from testing the OCR pipeline
+# Scratch output from testing the OCR pipeline - includes real extracted
+# bill content (GSTIN, amounts), same reason Bill_Samples/ is excluded
 tools/eng.traineddata
-tools/ocr_sample.txt
+tools/*.txt
 tools/*.png
