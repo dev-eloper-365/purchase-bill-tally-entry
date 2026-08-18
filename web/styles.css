@@ -330,6 +330,23 @@ td select.wide:focus {
   cursor: default;
 }
 
+/* Marks a row extracted via OCR (scanned/image PDF, no embedded text) so
+   it's obvious at a glance which rows need extra scrutiny. */
+.ocr-tag {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--warning-bg);
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  cursor: help;
+}
+
 /* expandable detail row: a form-like "Edit" card sits next to a
    receipt-style "Computed for voucher" card, so editing Qty/Rate visibly
    feeds the tax breakdown beside it instead of looking like six

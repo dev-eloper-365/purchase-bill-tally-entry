@@ -19,6 +19,8 @@ $mimeTypes = @{
     '.css'  = 'text/css; charset=utf-8'
     '.json' = 'application/json; charset=utf-8'
     '.map'  = 'application/json; charset=utf-8'
+    '.wasm' = 'application/wasm'
+    '.gz'   = 'application/gzip'
 }
 
 function Write-JsonResponse($context, $statusCode, $obj) {
@@ -92,6 +94,34 @@ function Handle-Config($context) {
     Write-JsonResponse $context 200 $cfg
 }
 
+$extractionLogDir = Join-Path $logDir 'extractions'
+if (-not (Test-Path $extractionLogDir)) { New-Item -ItemType Directory -Path $extractionLogDir | Out-Null }
+
+# The browser posts each bill's raw pdf.js text here right after
+# extraction, purely so it can be read back from disk afterward instead of
+# needing a manual copy/paste out of the "Show raw extracted text" panel
+# every time a new supplier layout needs diagnosing.
+function Handle-ExtractionLog($context) {
+    $reader = New-Object System.IO.StreamReader($context.Request.InputStream, [System.Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+
+    try {
+        $data = $body | ConvertFrom-Json
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+        $safeName = ($data.fileName -replace '[\\/:*?"<>|]', '_')
+        $logFile = Join-Path $extractionLogDir "$stamp`_$safeName.txt"
+        $diagJson = if ($data.diag) { $data.diag | ConvertTo-Json -Compress } else { '(none)' }
+        "=== FILE: $($data.fileName) ===`n=== SUPPLIER GSTIN: $($data.supplierGSTIN) ===`n=== TEMPLATE: $($data.template) ===`n=== DIAG: $diagJson ===`n`n$($data.rawText)" | Out-File -FilePath $logFile -Encoding utf8
+        Write-Host "[extraction-log] Saved logs\extractions\$stamp`_$safeName.txt" -ForegroundColor Yellow
+        Write-JsonResponse $context 200 @{ ok = $true }
+    }
+    catch {
+        Write-Host "[extraction-log] ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        Write-JsonResponse $context 400 @{ error = $_.Exception.Message }
+    }
+}
+
 $cfg = Get-Config
 $port = $cfg.bridgePort
 $prefix = "http://localhost:$port/"
@@ -133,6 +163,9 @@ while ($listener.IsListening) {
         }
         elseif ($context.Request.HttpMethod -eq 'GET' -and $urlPath -eq '/api/config') {
             Handle-Config $context
+        }
+        elseif ($context.Request.HttpMethod -eq 'POST' -and $urlPath -eq '/api/extraction-log') {
+            Handle-ExtractionLog $context
         }
         else {
             $relPath = $urlPath.TrimStart('/')

@@ -223,6 +223,7 @@ async function handleFiles(fileList) {
       supplierGSTIN: '',
       supplierLabel: '',
       template: '',
+      extractionMethod: 'text',
       invoiceNo: '',
       invoiceDate: '',
       invoiceDateTally: '',
@@ -257,6 +258,7 @@ async function extractOne(id, file) {
     row.supplierGSTIN = ext.supplierGSTIN || '';
     row.supplierLabel = ext.supplierLabel || '';
     row.template = ext.template;
+    row.extractionMethod = ext.extractionMethod || 'text';
     row.invoiceNo = ext.invoiceNo;
     row.invoiceDate = ext.invoiceDate;
     row.invoiceDateTally = ext.invoiceDateTally;
@@ -276,6 +278,21 @@ async function extractOne(id, file) {
 
     log(`Extracted ${file.name}: invoice ${row.invoiceNo || '?'}, ${row.qty || '?'} MTS @ ${row.rate || '?'}`);
     renderTable();
+
+    // Fire-and-forget: lets the raw pdf.js text for every upload be read
+    // straight from disk afterward instead of needing a manual copy/paste
+    // out of "Show raw extracted text" each time a layout needs diagnosing.
+    fetch('/api/extraction-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: file.name,
+        supplierGSTIN: row.supplierGSTIN,
+        template: row.template,
+        rawText: row.rawText,
+        diag: ext.diag,
+      }),
+    }).catch(() => {});
   } catch (e) {
     const row = findRow(id);
     if (row) {
@@ -450,9 +467,13 @@ function renderRow(row) {
 
   const supplierText = row.supplierLabel || row.supplierGSTIN || '';
   const statusLabel = STATUS_LABEL[row.status] || row.status;
+  const ocrTag =
+    row.extractionMethod === 'ocr'
+      ? '<span class="ocr-tag" title="Extracted via OCR (scanned image, no embedded text) - accuracy is lower, verify carefully">OCR</span>'
+      : '';
 
   return `<tr data-row-id="${row.id}" class="${row.expanded ? 'row-expanded' : ''} ${row.selected ? 'row-selected' : ''}">
-    <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}</td>
+    <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}${ocrTag}</td>
     ${supplierText ? ellipsisCell(supplierText, 'col-supplier') : '<td><span class="diff-flag">unknown</span></td>'}
     ${ellipsisCell(row.ledgerName, 'col-ledger')}
     ${ellipsisCell(row.invoiceNo, 'col-invno')}
@@ -485,7 +506,7 @@ function renderDetailRow(row) {
     <td colspan="12">
       <div class="detail-content-wrap">
         <div class="detail-top-context">
-          <div class="context-supplier">${escapeHtml(row.supplierLabel || 'Supplier not identified')} <span class="small-dim">${escapeHtml(row.supplierGSTIN) || 'GSTIN not detected'}</span></div>
+          <div class="context-supplier">${escapeHtml(row.supplierLabel || 'Supplier not identified')} <span class="small-dim">${escapeHtml(row.supplierGSTIN) || 'GSTIN not detected'}</span> ${row.extractionMethod === 'ocr' ? '<span class="ocr-tag">OCR</span>' : '<span class="small-dim">(digital text)</span>'}</div>
           ${notesHtml}
         </div>
         <div class="detail-panels">
