@@ -20,9 +20,17 @@ const KNOWN_SUPPLIERS = {
   '24AAGCV1903N1Z8': { label: 'VNU Coal Private Limited', template: 'vnucoal' },
 };
 
-const GSTIN_RE = /\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z]\d[A-Z]\b/g; // trailing PAN checksum char is often OCR-safe as [A-Z]
-// Real GSTIN checksum position varies in OCR'd text; use a looser 15-char scan as a fallback.
-const GSTIN_LOOSE_RE = /\b\d{2}[A-Z0-9]{13}\b/g;
+// Full 15-char shape (state code, 10-char PAN, entity code, literal "Z",
+// checksum) is specific enough on its own - no \b anchors. Anchors were
+// tried first but broke on real bills: after stripping whitespace to
+// rejoin a token pdf.js split apart, a GSTIN sitting right before the next
+// label (e.g. "...N1Z6StateName...", no punctuation between them) has no
+// word-boundary at its own end, since both the last GSTIN char and the
+// first letter of the next label are word characters - so the anchored
+// version silently found zero GSTINs on such bills. Confirmed against the
+// JAI SAI COAL TRADERS bill (GSTIN 24AAECJ7824N1Z6, immediately followed
+// by "State Name" with no separator once whitespace is stripped).
+const GSTIN_SHAPE_RE = /\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]/g;
 
 function stripCommas(numStr) {
   if (numStr == null) return NaN;
@@ -32,19 +40,14 @@ function stripCommas(numStr) {
 // pdf.js can split even a single visually-contiguous token (like a GSTIN)
 // across multiple text items, which inserts whitespace into it when the
 // items are joined. Matching against a whitespace-stripped copy sidesteps
-// that regardless of where the splits land, without weakening the GSTIN
-// shape check itself (still validated against the full 15-char pattern).
+// that regardless of where the splits land.
 function findAllGstins(text) {
   const compact = text.replace(/\s+/g, '');
   const found = new Set();
-  for (const re of [GSTIN_RE, GSTIN_LOOSE_RE]) {
-    re.lastIndex = 0;
-    let m;
-    while ((m = re.exec(compact))) {
-      if (/^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]$/.test(m[0])) {
-        found.add(m[0]);
-      }
-    }
+  GSTIN_SHAPE_RE.lastIndex = 0;
+  let m;
+  while ((m = GSTIN_SHAPE_RE.exec(compact))) {
+    found.add(m[0]);
   }
   return Array.from(found);
 }
@@ -367,6 +370,31 @@ function extractGeneric(text) {
   return out;
 }
 
+// Automatic, backend-driven fallback for a genuinely unrecognized supplier
+// (detectSupplier found no known GSTIN). Sends the already-extracted text
+// to the bridge's /api/ai-profile endpoint (Groq, server-side key). Never
+// throws: if the endpoint is disabled (no key configured), unreachable, or
+// returns something unusable, the caller just keeps extractGeneric's
+// result - behaviour is unchanged whenever AI profiling isn't available.
+async function tryAiProfile(text, fileName) {
+  try {
+    const resp = await fetch('/api/ai-profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, fileName }),
+    });
+    // 503 means the feature is simply not configured (no Groq key in
+    // .env) - that's not a failure worth flagging, just "not available".
+    if (resp.status === 503) return { ok: false, reason: 'not_configured' };
+    if (!resp.ok) return { ok: false, reason: 'error' };
+    const data = await resp.json();
+    if (!data || !data.fields) return { ok: false, reason: 'error' };
+    return { ok: true, fields: data.fields };
+  } catch {
+    return { ok: false, reason: 'error' };
+  }
+}
+
 // ---- Tax computation, matched to Tally's own arithmetic ---------------
 // Verified against the real posted voucher (49.050 MTS @ 10200) and all
 // four Agarwal sample bills: CGST/SGST are 9% of taxable, TCS is 2% of
@@ -446,100 +474,229 @@ function extractOcr(text) {
 // diag lets a caller distinguish "found text but my regexes are wrong"
 // from "pdf.js found zero text items" (e.g. a scanned/rasterized PDF with
 // no embedded text layer at all, which no amount of regex tuning fixes).
-async function pdfFileToText(file) {
+// Returns one text string per page (not one joined blob) so a caller can
+// tell where page boundaries are - needed to split a file that bundles
+// more than one bill.
+async function pdfFileToPages(file) {
   const diag = { numPages: null, itemsPerPage: [], totalItems: 0, error: null };
   try {
     const buf = await file.arrayBuffer();
     const loadingTask = pdfjsLib.getDocument({ data: buf });
     const pdf = await loadingTask.promise;
     diag.numPages = pdf.numPages;
-    let fullText = '';
+    const pages = [];
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const content = await page.getTextContent();
       diag.itemsPerPage.push(content.items.length);
       diag.totalItems += content.items.length;
+      let pageText = '';
       let lastY = null;
       for (const item of content.items) {
         const y = item.transform[5];
         if (lastY !== null && Math.abs(y - lastY) > 2) {
-          fullText += '\n';
+          pageText += '\n';
         }
-        fullText += item.str + ' ';
+        pageText += item.str + ' ';
         lastY = y;
       }
-      fullText += '\n';
+      pages.push(pageText);
     }
-    return { text: fullText, diag };
+    return { pages, diag };
   } catch (e) {
     diag.error = e && e.message ? e.message : String(e);
-    return { text: '', diag };
+    return { pages: [], diag };
   }
 }
 
-// Only called when pdfFileToText finds zero text items. Renders page 1 to
-// a canvas at 3x scale (higher DPI measurably improves OCR accuracy) and
-// runs it through the locally-vendored Tesseract engine - no network
-// calls, same "everything local" rule as pdf.js itself. Only page 1 is
-// OCR'd; every sample bill is a single line-item invoice with all the
-// numbers on the first page.
-async function ocrPdfPage(file) {
-  const diag = { numPages: null, ocrConfidence: null, error: null };
+// Only called when pdfFileToPages finds zero text items. Renders every
+// page to a canvas at 3x scale (higher DPI measurably improves OCR
+// accuracy) and runs each through the locally-vendored Tesseract engine -
+// no network calls, same "everything local" rule as pdf.js itself. Pages
+// run sequentially (each OCR pass is already a real cost - render + wasm
+// recognition), and one page failing doesn't lose the rest of a scanned
+// multi-page/multi-bill file.
+async function ocrPdfPages(file, onProgress) {
+  const diag = { numPages: null, perPage: [], error: null };
   try {
     const buf = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
     diag.numPages = pdf.numPages;
-    const page = await pdf.getPage(1);
-    const viewport = page.getViewport({ scale: 3.0 });
-    const canvas = document.createElement('canvas');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
-
-    const result = await Tesseract.recognize(canvas, 'eng', {
-      workerPath: 'vendor/worker.min.js',
-      corePath: 'vendor/tesseract-core/tesseract-core.wasm.js',
-      langPath: 'vendor/',
-      gzip: true,
-    });
-    diag.ocrConfidence = result.data.confidence;
-    return { text: result.data.text, diag };
+    const pages = [];
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      if (onProgress) onProgress('ocr-page', { page: pageNum, total: pdf.numPages });
+      const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale: 3.0 });
+      const canvas = document.createElement('canvas');
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext('2d');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      try {
+        const result = await Tesseract.recognize(canvas, 'eng', {
+          workerPath: 'vendor/worker.min.js',
+          corePath: 'vendor/tesseract-core/tesseract-core.wasm.js',
+          langPath: 'vendor/',
+          gzip: true,
+        });
+        pages.push(result.data.text);
+        diag.perPage.push({ confidence: result.data.confidence, error: null });
+      } catch (pageErr) {
+        pages.push('');
+        diag.perPage.push({ confidence: null, error: pageErr && pageErr.message ? pageErr.message : String(pageErr) });
+      }
+    }
+    return { pages, diag };
   } catch (e) {
     diag.error = e && e.message ? e.message : String(e);
-    return { text: '', diag };
+    return { pages: [], diag };
   }
 }
 
-async function extractBillFromFile(file) {
-  let { text, diag } = await pdfFileToText(file);
-  let extractionMethod = 'text';
-  const warnings = [];
+// Used only to decide where one bill ends and the next begins across a
+// file's pages - not a final field value (the per-supplier templates
+// still extract that, more precisely, from each group's own text once
+// grouping is done). A single generic pattern isn't reliable enough for
+// this: pdf.js reorders each supplier's layout differently (see the
+// per-extractor comments below), so a naive "Invoice No" + next-token
+// match ends up capturing the wrong thing entirely on some layouts - e.g.
+// it grabbed the literal word "e-Way" on Honestfalcon/VNU Coal bills
+// (whose real label reads "Invoice No.  e-Way Bill No." on one line, with
+// values only appearing on the *next* line) and the word "Invoice" itself
+// on MP Fuel bills (whose layout prints every label, then every colon,
+// then every value, in three separate blocks) - confirmed against real
+// captured text before shipping. So this reuses each known supplier's own
+// already-proven invoiceNo pattern once its GSTIN is detected, falling
+// back to the generic pattern (same one extractGeneric uses) otherwise.
+// Normalized (whitespace stripped, uppercased) so a trivial OCR/
+// formatting difference between two pages of the same bill doesn't
+// register as a different number. OCR'd pages need their own branch, same
+// reason extractGroupFields doesn't run the per-supplier switch on OCR
+// text either: Tesseract reads in visual order with character-level
+// noise, not pdf.js's per-generator content-stream order, so the "clean
+// text" patterns below can latch onto the wrong thing entirely (confirmed
+// on a real VNU Coal scan, where the e-Way-Bill-label pattern matched an
+// OCR-garbled fragment of the supplier's own name on the following line).
+function probeInvoiceNoOnPage(pageText, isOcr) {
+  if (isOcr) {
+    const m =
+      pageText.match(/(\d{3,8}\/\d{1,8}\/?)[^\n\d]{0,10}?(\d{1,2}-[A-Za-z]{3}-\d{2,4})/i) ||
+      pageText.match(/Invoice\s*No\.?[^\n]{0,40}?\n?\s*(\S{3,20})/i);
+    if (!m) return null;
+    return m[1].replace(/[|\[\]]/g, '').replace(/\s+/g, '').toUpperCase();
+  }
 
-  if (diag.error) {
-    warnings.push(`PDF failed to load: ${diag.error}`);
-  } else if (diag.totalItems === 0) {
-    // No embedded text at all - almost certainly a scanned/rasterized
-    // page, which no regex fix can address. Fall back to OCR rather than
-    // returning an empty row.
-    const ocrResult = await ocrPdfPage(file);
-    if (ocrResult.diag.error) {
-      warnings.push(
-        `No embedded text found (scanned/image PDF), and OCR failed: ${ocrResult.diag.error}. Every field needs manual entry.`
-      );
-    } else if (!ocrResult.text || !ocrResult.text.trim()) {
-      warnings.push('No embedded text found (scanned/image PDF), and OCR found nothing either. Every field needs manual entry.');
+  const supplier = detectSupplier(pageText);
+  let m;
+  switch (supplier.template) {
+    case 'agarwal':
+      m = pageText.match(/Invoice\s+No:\s*\n?\s*([A-Za-z0-9\/\-]+)/i);
+      break;
+    case 'mpfuel':
+      m =
+        pageText.match(
+          /Invoice\s+No\.\s*\n\s*Invoice\s+Date\s*\n\s*Delivery\s+Ex\s*\n\s*:\s*\n\s*:\s*\n\s*:\s*\n\s*([A-Za-z0-9\/\-]+)/i
+        ) || pageText.match(/Invoice\s+No\.[^\n]*\n[\s\S]{0,60}?:\s*\n\s*([A-Za-z0-9\/\-]+)/i);
+      break;
+    case 'honestfalcon':
+    case 'vnucoal':
+      m =
+        pageText.match(/Invoice\s+No\.\s*e-Way\s+Bill\s+No\.\s*\n\s*(\S+)/i) ||
+        pageText.match(/Invoice\s+No\.[^\n]*\n\s*(\S+)/i);
+      break;
+    default:
+      m = pageText.match(/Invoice\s*No\.?:?\s*\n?\s*([A-Za-z0-9\/\-]+)/i);
+  }
+  if (!m) return null;
+  return m[1].replace(/[|\[\]]/g, '').replace(/\s+/g, '').toUpperCase();
+}
+
+// Splits a file's pages into one group per distinct invoice number found.
+// Page 1 always starts the first group, whatever it contains (matches the
+// existing single-bill fallback for when no number is found anywhere in
+// the file). Any later page whose probed number differs from the
+// currently open group starts a new one; a page with no number, or the
+// same number repeated (e.g. a header reprinted on a continuation page),
+// attaches to the group already open - so a page 2 of pure tax-summary
+// tables joins the bill above it rather than becoming its own row, per
+// the confirmed default. A leading page with no detected number (e.g. an
+// odd cover page) becomes its own small first group rather than being
+// guessed forward onto a later bill - it'll surface with the same
+// missing-field warnings any bill with absent fields already gets today,
+// which is safer than silently merging two unrelated pages together.
+function groupPagesByInvoiceNo(pages, isOcr) {
+  const groups = [];
+  let currentProbe = null;
+  for (let i = 0; i < pages.length; i++) {
+    const probe = probeInvoiceNoOnPage(pages[i], isOcr);
+    const group = groups[groups.length - 1];
+    if (group && (probe === null || probe === currentProbe)) {
+      group.endPage = i + 1;
+      group.text += '\n' + pages[i];
     } else {
-      text = ocrResult.text;
-      extractionMethod = 'ocr';
-      diag = { ...diag, ocr: ocrResult.diag };
-      warnings.push(
-        `Extracted via OCR (scanned image, no embedded text in the PDF, confidence ${
-          ocrResult.diag.ocrConfidence != null ? ocrResult.diag.ocrConfidence.toFixed(0) + '%' : 'unknown'
-        }) - accuracy is lower than digital text. Verify every field carefully before sending.`
-      );
+      groups.push({ startPage: i + 1, endPage: i + 1, text: pages[i] });
+      currentProbe = probe;
     }
   }
+  if (groups.length === 0) groups.push({ startPage: 1, endPage: 1, text: '' });
+  return groups;
+}
+
+// Step 1 of extraction: get a file down to per-bill text groups. Fast and
+// fully local (no AI) - the caller runs this first so it can create the
+// right number of rows before the slower per-group field extraction (and
+// possible AI calls) begin. onProgress here only ever reports OCR
+// page-by-page progress ('ocr-page'), since AI hasn't been reached yet.
+async function splitFileIntoGroups(file, onProgress) {
+  let { pages, diag } = await pdfFileToPages(file);
+  let extractionMethod = 'text';
+
+  if (diag.error) {
+    diag.ocrWarnings = [`PDF failed to load: ${diag.error}`];
+    return { groups: [{ startPage: 1, endPage: 1, text: '' }], diag, extractionMethod };
+  }
+
+  if (diag.totalItems === 0) {
+    // No embedded text at all - almost certainly a scanned/rasterized
+    // file, which no regex fix can address. Fall back to OCR, page by
+    // page, rather than returning an empty row.
+    const ocrResult = await ocrPdfPages(file, onProgress);
+    extractionMethod = 'ocr';
+    diag = { ...diag, ocr: ocrResult.diag };
+    pages = ocrResult.pages;
+
+    const confidences = ocrResult.diag.perPage.map((p) => p.confidence).filter((c) => c != null);
+    const anyText = pages.some((p) => p && p.trim());
+    if (ocrResult.diag.error) {
+      diag.ocrWarnings = [
+        `No embedded text found (scanned/image PDF), and OCR failed: ${ocrResult.diag.error}. Every field needs manual entry.`,
+      ];
+    } else if (!anyText) {
+      diag.ocrWarnings = ['No embedded text found (scanned/image PDF), and OCR found nothing either. Every field needs manual entry.'];
+    } else {
+      const avgConfidence = confidences.length ? confidences.reduce((a, b) => a + b, 0) / confidences.length : null;
+      diag.ocrWarnings = [
+        `Extracted via OCR (scanned image, no embedded text in the PDF, confidence ${
+          avgConfidence != null ? avgConfidence.toFixed(0) + '%' : 'unknown'
+        }) - accuracy is lower than digital text. Verify every field carefully before sending.`,
+      ];
+    }
+  }
+
+  const groups = groupPagesByInvoiceNo(pages.length ? pages : [''], extractionMethod === 'ocr');
+  return { groups, diag, extractionMethod };
+}
+
+// Step 2 of extraction: given one bill's already-grouped text, find its
+// fields. This is the part of the old single-shot extractBillFromFile
+// that runs once per bill - unchanged logic, it just no longer loads the
+// PDF itself. fileDiag is the whole file's diag (shared across every
+// group split from the same file): it carries the OCR-quality/load-error
+// warnings computed once in splitFileIntoGroups, plus (per call) this
+// group's own page range for traceability.
+async function extractGroupFields(text, fileLabel, extractionMethod, fileDiag, onProgress) {
+  let aiStatus;
+  const warnings = [...(fileDiag.ocrWarnings || [])];
 
   const supplier = detectSupplier(text);
 
@@ -566,6 +723,45 @@ async function extractBillFromFile(file) {
       default:
         fields = extractGeneric(text);
     }
+
+    if (supplier.template === 'generic') {
+      if (onProgress) onProgress('ai-pending');
+      const aiResult = await tryAiProfile(text, fileLabel);
+      if (aiResult.ok) {
+        const aiFields = aiResult.fields;
+        extractionMethod = 'ai';
+        if (aiFields.invoiceNo != null) fields.invoiceNo = aiFields.invoiceNo;
+        if (aiFields.invoiceDateRaw != null) fields.invoiceDateRaw = aiFields.invoiceDateRaw;
+        if (aiFields.vehicleNo != null) fields.vehicleNo = aiFields.vehicleNo;
+        if (aiFields.qty != null) fields.qty = aiFields.qty;
+        if (aiFields.rate != null) fields.rate = aiFields.rate;
+        // Some layouts print our own name/GSTIN prominently near the top
+        // (as the buyer) before the real supplier appears further down -
+        // seen for real on a Taranjot Energy bill, where the AI echoed our
+        // own GSTIN back as if it were the supplier's. Never accept that.
+        if (!supplier.gstin && aiFields.supplierGSTIN && aiFields.supplierGSTIN !== SELF_GSTIN) {
+          supplier.gstin = aiFields.supplierGSTIN;
+        }
+        if (!supplier.label && aiFields.supplierName && !/DELTA\s*GLOBAL/i.test(aiFields.supplierName)) {
+          supplier.label = aiFields.supplierName;
+        }
+        fields.warnings = [
+          ...(fields.warnings || []),
+          'Fields pre-filled with AI assistance (unrecognized supplier layout) - verify every field carefully.',
+        ];
+        aiStatus = 'ok';
+        if (onProgress) onProgress('ai-ok');
+      } else if (aiResult.reason === 'error') {
+        fields.warnings = [
+          ...(fields.warnings || []),
+          'AI-assisted extraction was attempted but failed - falling back to generic pattern matching.',
+        ];
+        aiStatus = 'failed';
+        if (onProgress) onProgress('ai-failed');
+      } else {
+        if (onProgress) onProgress('ai-skip');
+      }
+    }
   }
 
   const invoiceDateIso = parseBillDate(fields.invoiceDateRaw);
@@ -574,7 +770,7 @@ async function extractBillFromFile(file) {
   const computed = qty && rate ? computeTax(qty, rate) : null;
 
   warnings.push(...(fields.warnings || []));
-  if (extractionMethod !== 'ocr' && !diag.error && diag.totalItems !== 0) {
+  if (extractionMethod !== 'ocr' && !fileDiag.error && fileDiag.totalItems !== 0) {
     if (!supplier.gstin) warnings.push('Supplier GSTIN could not be determined - pick a ledger manually.');
     if (supplier.ambiguousGstins && supplier.ambiguousGstins.length > 1) {
       warnings.push(`Multiple unrecognised GSTINs found (${supplier.ambiguousGstins.join(', ')}) - confirm supplier.`);
@@ -586,11 +782,12 @@ async function extractBillFromFile(file) {
   if (!qty || !rate) warnings.push('Quantity/rate not found - cannot compute GST.');
 
   return {
-    fileName: file.name,
+    fileName: fileLabel,
     supplierGSTIN: supplier.gstin,
     supplierLabel: supplier.label,
     template: supplier.template,
     extractionMethod,
+    aiStatus,
     invoiceNo: fields.invoiceNo || '',
     invoiceDate: invoiceDateIso || '',
     invoiceDateTally: isoToTally(invoiceDateIso),
@@ -602,12 +799,13 @@ async function extractBillFromFile(file) {
     computed,
     warnings,
     rawText: text,
-    diag,
+    diag: fileDiag,
   };
 }
 
 window.BillExtract = {
-  extractBillFromFile,
+  splitFileIntoGroups,
+  extractGroupFields,
   computeTax,
   parseBillDate,
   isoToTally,

@@ -13,3 +13,6 @@ tools/node_modules/
 tools/eng.traineddata
 tools/*.txt
 tools/*.png
+
+# Local secrets/overrides (Groq API key, Tally port) - never committed
+.env

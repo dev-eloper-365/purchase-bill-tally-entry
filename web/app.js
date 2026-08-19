@@ -170,23 +170,40 @@ async function loadLedgers() {
       'Continue?'
   );
   if (!ok) return;
-  log('Loading ledgers + groups from ' + CONFIG.companyName + ' …');
+
+  // Sequential, not Promise.all: Tally has been intermittently unstable
+  // today, and running two heavy collection queries at once adds more
+  // simultaneous load than one at a time. Just as importantly, each
+  // result is kept independently - if groups fails after ledgers
+  // succeeded, the ledger list (and datalist) is still usable instead of
+  // the whole attempt being discarded together.
+  log('Loading ledgers from ' + CONFIG.companyName + ' …');
+  let ledgers;
   try {
-    const [ledgers, groupMap] = await Promise.all([
-      Tally.fetchLedgers(CONFIG.companyName),
-      Tally.fetchGroups(CONFIG.companyName),
-    ]);
-    ledgersCache = { ledgers, groupMap };
+    ledgers = await Tally.fetchLedgers(CONFIG.companyName);
     const datalist = document.getElementById('ledgersDatalist');
-    datalist.innerHTML = ledgers
-      .map((l) => `<option value="${escapeHtml(l.name)}"></option>`)
-      .join('');
-    log(`Loaded ${ledgers.length} ledgers, ${Object.keys(groupMap).length} groups.`, 'ok');
-    rematchAllRows();
-    renderTable();
+    datalist.innerHTML = ledgers.map((l) => `<option value="${escapeHtml(l.name)}"></option>`).join('');
+    log(`Loaded ${ledgers.length} ledgers.`, 'ok');
   } catch (e) {
     log('Failed to load ledgers: ' + e.message, 'err');
+    return;
   }
+
+  log('Loading groups from ' + CONFIG.companyName + ' …');
+  let groupMap = (ledgersCache && ledgersCache.groupMap) || {};
+  try {
+    groupMap = await Tally.fetchGroups(CONFIG.companyName);
+    log(`Loaded ${Object.keys(groupMap).length} groups.`, 'ok');
+  } catch (e) {
+    log(
+      'Failed to load groups: ' + e.message + ' - ledger names are available, but creditor/debtor matching may be incomplete until this succeeds.',
+      'err'
+    );
+  }
+
+  ledgersCache = { ledgers, groupMap };
+  rematchAllRows();
+  renderTable();
 }
 
 function rematchAllRows() {
@@ -209,6 +226,37 @@ function rematchAllRows() {
 
 // ---- upload / extraction --------------------------------------------------
 
+function makeRow(fileName) {
+  return {
+    id: genId(),
+    fileName,
+    status: 'extracting',
+    supplierGSTIN: '',
+    supplierLabel: '',
+    template: '',
+    extractionMethod: 'text',
+    invoiceNo: '',
+    invoiceDate: '',
+    invoiceDateTally: '',
+    vehicleNo: '',
+    qty: null,
+    rate: null,
+    computed: null,
+    printedTotal: null,
+    ledgerName: '',
+    ledgerCandidates: [],
+    manualLedgerEntry: false,
+    warnings: [],
+    errors: [],
+    tallyResult: null,
+    expanded: false,
+    rawText: '',
+    showRawText: false,
+    selected: false,
+    dirty: false,
+  };
+}
+
 async function handleFiles(fileList) {
   const files = Array.from(fileList).filter((f) => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
   if (files.length === 0) {
@@ -216,85 +264,136 @@ async function handleFiles(fileList) {
     return;
   }
   for (const file of files) {
-    const row = {
-      id: genId(),
-      fileName: file.name,
-      status: 'extracting',
-      supplierGSTIN: '',
-      supplierLabel: '',
-      template: '',
-      extractionMethod: 'text',
-      invoiceNo: '',
-      invoiceDate: '',
-      invoiceDateTally: '',
-      vehicleNo: '',
-      qty: null,
-      rate: null,
-      computed: null,
-      printedTotal: null,
-      ledgerName: '',
-      ledgerCandidates: [],
-      manualLedgerEntry: false,
-      warnings: [],
-      errors: [],
-      tallyResult: null,
-      expanded: false,
-      rawText: '',
-      showRawText: false,
-      selected: false,
-      dirty: false,
-    };
+    // One placeholder row per file for instant feedback, same as before a
+    // file could turn out to bundle more than one bill - processFile below
+    // replaces this with N rows once page-grouping (fast, local, no AI)
+    // has run and the real count is known.
+    const row = makeRow(file.name);
     bills.push(row);
     renderTable();
-    extractOne(row.id, file);
+    processFile(row.id, file);
   }
 }
 
-async function extractOne(id, file) {
-  try {
-    const ext = await BillExtract.extractBillFromFile(file);
-    const row = findRow(id);
-    if (!row) return;
-    row.supplierGSTIN = ext.supplierGSTIN || '';
-    row.supplierLabel = ext.supplierLabel || '';
-    row.template = ext.template;
-    row.extractionMethod = ext.extractionMethod || 'text';
-    row.invoiceNo = ext.invoiceNo;
-    row.invoiceDate = ext.invoiceDate;
-    row.invoiceDateTally = ext.invoiceDateTally;
-    row.vehicleNo = ext.vehicleNo;
-    row.qty = ext.qty;
-    row.rate = ext.rate;
-    row.computed = ext.computed;
-    row.printedTotal = ext.printedTotal;
-    row.warnings = ext.warnings;
-    row.rawText = ext.rawText;
-    row.status = 'needs_review';
+// Wires a group's onProgress callback (AI-pending/ok/failed, OCR-page
+// progress) to patch just that row's DOM, same mechanism used for the
+// single-bill case before multi-bill splitting existed.
+function makeGroupProgressHandler(rowId) {
+  return (stage, info) => {
+    const liveRow = findRow(rowId);
+    if (!liveRow) return;
+    if (stage === 'ai-pending') liveRow.aiStatus = 'pending';
+    else if (stage === 'ai-ok') liveRow.aiStatus = 'ok';
+    else if (stage === 'ai-failed') liveRow.aiStatus = 'failed';
+    else if (stage === 'ai-skip') liveRow.aiStatus = undefined;
+    else if (stage === 'ocr-page') liveRow.ocrProgress = info;
+    if (document.querySelector(`tr[data-row-id="${liveRow.id}"]`)) {
+      patchRowDom(liveRow.id);
+    }
+  };
+}
 
-    if (ledgersCache && row.supplierGSTIN) {
-      row.ledgerCandidates = Tally.matchLedgersForGstin(row.supplierGSTIN, ledgersCache.ledgers, ledgersCache.groupMap);
-      if (row.ledgerCandidates.length > 0) row.ledgerName = row.ledgerCandidates[0].name;
+function logExtraction(row, diag) {
+  // Fire-and-forget: lets the raw pdf.js text for every upload be read
+  // straight from disk afterward instead of needing a manual copy/paste
+  // out of "Show raw extracted text" each time a layout needs diagnosing.
+  fetch('/api/extraction-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fileName: row.fileName,
+      supplierGSTIN: row.supplierGSTIN,
+      template: row.template,
+      rawText: row.rawText,
+      diag,
+    }),
+  }).catch(() => {});
+}
+
+function applyExtractionResult(row, ext) {
+  row.supplierGSTIN = ext.supplierGSTIN || '';
+  row.supplierLabel = ext.supplierLabel || '';
+  row.template = ext.template;
+  row.extractionMethod = ext.extractionMethod || 'text';
+  row.aiStatus = ext.aiStatus;
+  row.invoiceNo = ext.invoiceNo;
+  row.invoiceDate = ext.invoiceDate;
+  row.invoiceDateTally = ext.invoiceDateTally;
+  row.vehicleNo = ext.vehicleNo;
+  row.qty = ext.qty;
+  row.rate = ext.rate;
+  row.computed = ext.computed;
+  row.printedTotal = ext.printedTotal;
+  row.warnings = ext.warnings;
+  row.rawText = ext.rawText;
+  row.status = 'needs_review';
+
+  if (ledgersCache && row.supplierGSTIN) {
+    row.ledgerCandidates = Tally.matchLedgersForGstin(row.supplierGSTIN, ledgersCache.ledgers, ledgersCache.groupMap);
+    if (row.ledgerCandidates.length > 0) row.ledgerName = row.ledgerCandidates[0].name;
+  }
+}
+
+async function processFile(placeholderId, file) {
+  try {
+    const split = await BillExtract.splitFileIntoGroups(file, makeGroupProgressHandler(placeholderId));
+    const groups = split.groups;
+    const multi = groups.length > 1;
+
+    // rowsForGroups[i] is the row that group i's extraction result should
+    // land in. Single-bill files keep the placeholder untouched (no page
+    // range in the name) so the common case looks exactly as it always
+    // has; a genuine multi-bill file swaps the placeholder out for one
+    // labeled row per bill before any of the (slower, possibly AI-calling)
+    // per-group extraction starts, so the row count is right immediately.
+    let rowsForGroups;
+    if (!multi) {
+      rowsForGroups = [findRow(placeholderId)];
+      if (!rowsForGroups[0]) return;
+    } else {
+      bills = bills.filter((b) => b.id !== placeholderId);
+      rowsForGroups = groups.map((g) => {
+        const label = g.startPage === g.endPage ? `p.${g.startPage}` : `p.${g.startPage}-${g.endPage}`;
+        const row = makeRow(`${file.name} (${label})`);
+        bills.push(row);
+        return row;
+      });
+      renderTable();
+      log(`${file.name}: found ${groups.length} separate bills (different invoice numbers per page) - split into ${groups.length} rows.`);
     }
 
-    log(`Extracted ${file.name}: invoice ${row.invoiceNo || '?'}, ${row.qty || '?'} MTS @ ${row.rate || '?'}`);
-    renderTable();
-
-    // Fire-and-forget: lets the raw pdf.js text for every upload be read
-    // straight from disk afterward instead of needing a manual copy/paste
-    // out of "Show raw extracted text" each time a layout needs diagnosing.
-    fetch('/api/extraction-log', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fileName: file.name,
-        supplierGSTIN: row.supplierGSTIN,
-        template: row.template,
-        rawText: row.rawText,
-        diag: ext.diag,
-      }),
-    }).catch(() => {});
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      const row = rowsForGroups[i];
+      if (!row) continue;
+      const fileLabel = row.fileName;
+      try {
+        const groupDiag = { ...split.diag, startPage: group.startPage, endPage: group.endPage };
+        const ext = await BillExtract.extractGroupFields(
+          group.text,
+          fileLabel,
+          split.extractionMethod,
+          groupDiag,
+          makeGroupProgressHandler(row.id)
+        );
+        const liveRow = findRow(row.id);
+        if (!liveRow) continue;
+        applyExtractionResult(liveRow, ext);
+        log(`Extracted ${fileLabel}: invoice ${liveRow.invoiceNo || '?'}, ${liveRow.qty || '?'} MTS @ ${liveRow.rate || '?'}`);
+        renderTable();
+        logExtraction(liveRow, ext.diag);
+      } catch (e) {
+        const liveRow = findRow(row.id);
+        if (liveRow) {
+          liveRow.status = 'error';
+          liveRow.warnings = ['Extraction failed: ' + e.message];
+          renderTable();
+        }
+        log(`Extraction failed for ${fileLabel}: ${e.message}`, 'err');
+      }
+    }
   } catch (e) {
-    const row = findRow(id);
+    const row = findRow(placeholderId);
     if (row) {
       row.status = 'error';
       row.warnings = ['Extraction failed: ' + e.message];
@@ -455,8 +554,14 @@ function renderRow(row) {
     // Nothing is known yet - showing "unknown"/dashes in every cell reads
     // like extraction already ran and failed. Skeleton placeholders make
     // "still loading" visually obvious instead.
+    const aiPendingTag =
+      row.aiStatus === 'pending'
+        ? '<span class="ai-tag ai-tag-pending" title="Unrecognized supplier - asking AI to help identify fields">Trying AI&hellip;</span>'
+        : row.ocrProgress
+        ? `<span class="ai-tag ai-tag-pending" title="Scanned PDF - OCR reading each page">OCR page ${row.ocrProgress.page}/${row.ocrProgress.total}&hellip;</span>`
+        : '';
     return `<tr data-row-id="${row.id}">
-    <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}</td>
+    <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}${aiPendingTag}</td>
     ${skeletonCell('col-supplier')}
     ${skeletonCell('col-ledger')}
     ${skeletonCell('col-invno')}
@@ -508,6 +613,10 @@ function renderRow(row) {
   const ocrTag =
     row.extractionMethod === 'ocr'
       ? '<span class="ocr-tag" title="Extracted via OCR (scanned image, no embedded text) - accuracy is lower, verify carefully">OCR</span>'
+      : row.extractionMethod === 'ai'
+      ? '<span class="ai-tag" title="Extracted with AI assistance (unrecognized supplier layout) - verify every field carefully">AI</span>'
+      : row.aiStatus === 'failed'
+      ? '<span class="ai-tag ai-tag-failed" title="AI-assisted extraction was tried and failed - fields are generic-pattern guesses only, verify carefully">AI failed</span>'
       : '';
 
   return `<tr data-row-id="${row.id}" class="${row.expanded ? 'row-expanded' : ''} ${row.selected ? 'row-selected' : ''}">
@@ -544,7 +653,7 @@ function renderDetailRow(row) {
     <td colspan="12">
       <div class="detail-content-wrap">
         <div class="detail-top-context">
-          <div class="context-supplier">${escapeHtml(row.supplierLabel || 'Supplier not identified')} <span class="small-dim">${escapeHtml(row.supplierGSTIN) || 'GSTIN not detected'}</span> ${row.extractionMethod === 'ocr' ? '<span class="ocr-tag">OCR</span>' : '<span class="small-dim">(digital text)</span>'}</div>
+          <div class="context-supplier">${escapeHtml(row.supplierLabel || 'Supplier not identified')} <span class="small-dim">${escapeHtml(row.supplierGSTIN) || 'GSTIN not detected'}</span> ${row.extractionMethod === 'ocr' ? '<span class="ocr-tag">OCR</span>' : row.extractionMethod === 'ai' ? '<span class="ai-tag">AI</span>' : row.aiStatus === 'failed' ? '<span class="ai-tag ai-tag-failed">AI failed</span>' : '<span class="small-dim">(digital text)</span>'}</div>
           ${notesHtml}
         </div>
         <div class="detail-panels">

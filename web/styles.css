@@ -29,6 +29,7 @@
   --warning: #b45309;
   --warning-bg: #fffbeb;
   --info: #2563eb;
+  --info-bg: #eff6ff;
   --radius: 6px;
   --mono: ui-monospace, 'SF Mono', 'Consolas', monospace;
 }
@@ -57,6 +58,7 @@
   --warning: #fbbf24;
   --warning-bg: #302005;
   --info: #60a5fa;
+  --info-bg: #0f1f30;
 }
 
 * { box-sizing: border-box; }
@@ -345,6 +347,46 @@ td select.wide:focus {
   font-weight: 700;
   letter-spacing: 0.03em;
   cursor: help;
+}
+
+/* Marks a row extracted with AI assistance (unrecognized supplier layout,
+   profiled via Groq) - a distinct colour from OCR so the two "extra
+   scrutiny" reasons aren't confused at a glance. */
+.ai-tag {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--info-bg);
+  color: var(--info);
+  border: 1px solid var(--info);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  cursor: help;
+}
+
+/* Mid-flight state: shown next to the filename while extractBillFromFile
+   is awaiting the AI call for an unrecognized supplier, before the row's
+   fields exist at all. Pulses gently so it doesn't read as a static label. */
+.ai-tag-pending {
+  cursor: default;
+  animation: ai-tag-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ai-tag-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+/* AI was attempted for this row but returned nothing usable - fields are
+   still just the generic-pattern guesses, flagged distinctly from a row
+   where AI was never tried (known supplier) or succeeded. */
+.ai-tag-failed {
+  background: var(--destructive-bg);
+  color: var(--destructive);
+  border-color: var(--destructive);
 }
 
 /* Row still being extracted: shimmer placeholders instead of dashes/

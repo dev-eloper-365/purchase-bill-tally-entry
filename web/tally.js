@@ -195,11 +195,25 @@ function groupRoot(groupName, groupMap, maxHops = 25) {
   return chain; // chain[0] = original group, chain[last] = root
 }
 
+// A handful of ledgers are genuinely purchase-side but sit under a group
+// that resolves through Sundry Debtors for reasons unrelated to buy/sell
+// (e.g. grouped by salesperson name rather than counterparty role) - the
+// "ignore sales" rule would otherwise wrongly exclude them too. Rather
+// than weaken that rule generally (a name-pattern heuristic like "contains
+// PURCHASE" could misfire on a differently-named ledger later), each
+// exception is named exactly here so it's a deliberate, auditable
+// decision, not a rule change. Add to this only when a ledger is
+// confirmed correct despite its Tally group placement.
+const CREDITOR_OVERRIDE_LEDGERS = new Set([
+  'Jai Sai Coal Traders Private Limited (PURCHASE)',
+]);
+
 // A ledger counts as a purchase-side creditor if its group chain passes
 // through "Sundry Creditors" before reaching the primary root. Anything
 // resolving through "Sundry Debtors" is the sales side of the same
 // supplier and must be excluded per the "ignore sales" rule.
 function classifyLedger(ledger, groupMap) {
+  if (CREDITOR_OVERRIDE_LEDGERS.has(ledger.name)) return 'creditor';
   const chain = groupRoot(ledger.parent, groupMap);
   if (chain.includes('Sundry Creditors')) return 'creditor';
   if (chain.includes('Sundry Debtors')) return 'debtor';
