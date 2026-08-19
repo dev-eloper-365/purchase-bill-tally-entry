@@ -18,6 +18,7 @@ const KNOWN_SUPPLIERS = {
   '24AAQCM6956J1ZS': { label: 'MP Fuel Solution Private Limited', template: 'mpfuel' },
   '24AAGCH8484E1ZF': { label: 'Honestfalcon Resources Pvt Ltd', template: 'honestfalcon' },
   '24AAGCV1903N1Z8': { label: 'VNU Coal Private Limited', template: 'vnucoal' },
+  '24AAECJ7824N1Z6': { label: 'Jai Sai Coal Traders Private Limited', template: 'jaisai' },
 };
 
 // Full 15-char shape (state code, 10-char PAN, entity code, literal "Z",
@@ -345,6 +346,41 @@ function extractVnuCoal(text) {
       out.warnings.push('Qty/rate recovered from the tax summary grid, not the line-item row - verify against the PDF.');
     }
   }
+
+  return out;
+}
+
+// Promoted from an AI-drafted profile after cross-checking every field by
+// hand against the real captured pdf.js text (JS/L/3731/26-27) - not
+// trusting the AI's own regex output directly, same discipline as every
+// other template here. Layout is a standard e-Invoice, single "Invoice
+// No." label (no combined "e-Way Bill No." on the same line the way
+// Honestfalcon/VNU Coal print it).
+function extractJaiSai(text) {
+  const out = { warnings: [] };
+
+  let m = text.match(/Invoice\s+No\.[^\n]*\n\s*(\S+)/i);
+  out.invoiceNo = m ? m[1].trim() : null;
+
+  m = text.match(/\bDated\b\s*\n?\s*(\d{1,2}[-\/][A-Za-z]{3,9}[-\/]\d{2,4})/i);
+  out.invoiceDateRaw = m ? m[1].trim() : null;
+
+  // Real bills seen splitting one order across two trucks, each printed
+  // as "<plate>-<partial qty>" right after the line item (e.g.
+  // "GJ12BT1208-40.74"). Collect every plate found this way and join them,
+  // rather than picking just one - narration should show the full load.
+  const vehicles = [...text.matchAll(/\b([A-Z]{2}\d{2}[A-Z]{2,4}\d{4})-[\d.]+/g)].map((v) => v[1]);
+  out.vehicleNo = vehicles.length ? vehicles.join(' / ') : null;
+
+  m = text.match(/USA\s+IMPORTED\s+COAL\s+([\d,]+\.\d{2})\s+MT\s+([\d,]+\.\d{2})\s+([\d.]+)\s+MT\s+\d{4,8}/i);
+  if (m) {
+    out.taxableFromBill = stripCommas(m[1]);
+    out.rate = stripCommas(m[2]);
+    out.qty = stripCommas(m[3]);
+  }
+
+  m = text.match(/\bTotal\b[^\d]{0,8}([\d,]+\.\d{2})\s+([\d.]+)\s+MT/i);
+  out.printedTotal = m ? stripCommas(m[1]) : null;
 
   return out;
 }
@@ -719,6 +755,9 @@ async function extractGroupFields(text, fileLabel, extractionMethod, fileDiag, o
         break;
       case 'vnucoal':
         fields = extractVnuCoal(text);
+        break;
+      case 'jaisai':
+        fields = extractJaiSai(text);
         break;
       default:
         fields = extractGeneric(text);

@@ -250,6 +250,7 @@ td.col-file, th.col-file { position: sticky; left: 0; background: var(--card); z
 }
 .col-supplier { max-width: 150px; }
 .col-ledger { max-width: 190px; }
+.col-goods { max-width: 170px; }
 .col-invno { max-width: 100px; }
 .col-vehicle { max-width: 110px; }
 

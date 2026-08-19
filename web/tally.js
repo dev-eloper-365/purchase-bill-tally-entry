@@ -20,6 +20,42 @@ const MASTERS = {
   unit: 'MTS',
 };
 
+// Verified against a real DGRPL voucher (No. 8409, 19-Aug-26, party
+// HONESTFALCON RESOURCES PRIVATE LIMITED-PURCHASE, 42.270 MTS @
+// 7950.00/MTS) - DGRPL is not "GJ with different data", it's a genuinely
+// different master set (confirmed: every tax figure on that voucher still
+// matches computeTax()'s existing formula exactly, so only the NAMES
+// differ here, not the arithmetic). This covers Gujarat/intrastate
+// purchases from the already-known suppliers only. DGRPL also has a real,
+// heavily-used interstate pattern (IGST as a single ledger instead of a
+// CGST+SGST split, state-suffixed stock items/voucher types like
+// "Imported Steam Coal @18% KTK") that is NOT covered here - that's a real
+// GST-rule difference, not a naming one, and deliberately out of scope.
+const MASTERS_DGRPL = {
+  voucherType: 'Steam Coal Purchase @  18% GST', // two spaces before "18%" - confirmed via real voucher XML, not just the Tally UI's rendering
+  stockItem: 'Imported Steam Coal - TR', // identical to GJ
+  godown: 'Main Location', // identical to GJ
+  purchaseLedger: 'Steam Coal Purchase @ 18% GST', // one space - a DIFFERENT string than voucherType above despite looking similar
+  cgstLedger: 'CGST INPUT 9%', // word order swapped vs GJ's "Input CGST 9%"
+  sgstLedger: 'SGST INPUT 9%',
+  roundOffLedger: 'ROUNDING OFF', // vs GJ's "ROUND OFF"
+  tcsLedgerOld: 'TCS RECEIVABLE F.Y.25-26', // confirmed identical to GJ's string via live probe
+  tcsLedgerNew: 'TCS RECEIVABLE FY 2026-27', // no periods - different format than GJ's "F.Y.26-27", confirmed via real voucher
+  tcsCutoverIso: '2026-04-01',
+  unit: 'MTS',
+};
+
+const MASTERS_BY_COMPANY = {
+  'DELTA GLOBAL PRIVATE LIMITED GJ 2025-26': MASTERS,
+  'Delta Global Resources Private Limited 2025-26': MASTERS_DGRPL,
+};
+
+// Falls back to GJ's masters for any company not explicitly configured -
+// matches today's behavior everywhere except DGRPL.
+function getMasters(companyName) {
+  return MASTERS_BY_COMPANY[companyName] || MASTERS;
+}
+
 function xmlEscape(s) {
   if (s == null) return '';
   return String(s)
@@ -29,9 +65,9 @@ function xmlEscape(s) {
     .replace(/"/g, '&quot;');
 }
 
-function pickTcsLedger(invoiceDateIso) {
-  if (!invoiceDateIso) return MASTERS.tcsLedgerNew;
-  return invoiceDateIso >= MASTERS.tcsCutoverIso ? MASTERS.tcsLedgerNew : MASTERS.tcsLedgerOld;
+function pickTcsLedger(invoiceDateIso, masters) {
+  if (!invoiceDateIso) return masters.tcsLedgerNew;
+  return invoiceDateIso >= masters.tcsCutoverIso ? masters.tcsLedgerNew : masters.tcsLedgerOld;
 }
 
 async function tallyPost(xml) {
@@ -108,26 +144,50 @@ async function probeVoucherTypeExists(companyName, voucherTypeName) {
 // Full masters check for the currently configured company: every ledger,
 // stock item and voucher type this app depends on, probed one at a time.
 async function checkRequiredMasters(companyName) {
+  const masters = getMasters(companyName);
   const results = [];
   const ledgerNames = [
-    MASTERS.purchaseLedger,
-    MASTERS.cgstLedger,
-    MASTERS.sgstLedger,
-    MASTERS.roundOffLedger,
-    MASTERS.tcsLedgerOld,
-    MASTERS.tcsLedgerNew,
+    masters.purchaseLedger,
+    masters.cgstLedger,
+    masters.sgstLedger,
+    masters.roundOffLedger,
+    masters.tcsLedgerOld,
+    masters.tcsLedgerNew,
   ];
   for (const name of ledgerNames) {
     const r = await probeLedgerExists(companyName, name);
     results.push({ kind: 'Ledger', name, exists: r.exists });
     await sleep(150);
   }
-  const stockR = await probeStockItemExists(companyName, MASTERS.stockItem);
-  results.push({ kind: 'StockItem', name: MASTERS.stockItem, exists: stockR.exists });
-  await sleep(150);
-  const vtR = await probeVoucherTypeExists(companyName, MASTERS.voucherType);
-  results.push({ kind: 'VoucherType', name: MASTERS.voucherType, exists: vtR.exists });
+  // Stock item is no longer a single shared master - it's per-row (default
+  // "Imported Steam Coal - TR", overridable to any real Tally stock item),
+  // checked per-row during preflight instead, same as the party ledger.
+  const vtR = await probeVoucherTypeExists(companyName, masters.voucherType);
+  results.push({ kind: 'VoucherType', name: masters.voucherType, exists: vtR.exists });
   return results;
+}
+
+// ---- Stock item list (only called explicitly, one company) -------------
+// Same narrow Collection+NATIVEMETHOD shape as fetchLedgers/fetchGroups -
+// proven safe against this Tally, unlike a full unrestricted object dump.
+//
+// This company file's stock item list is NOT scoped to purchase goods -
+// it spans thousands of items belonging to an entirely unrelated business
+// line (confirmed live: stock groups for things like apparel sit
+// alongside "Goods"). An unfiltered fetch would dump all of that into the
+// dropdown. Filtered server-side to items directly under the "Goods"
+// stock group, which is exactly the coal/iron/ore item set this app
+// deals with (~35 items, confirmed against the real company).
+async function fetchStockItems(companyName) {
+  const xml = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>AppStockItems</ID></HEADER><BODY><DESC><STATICVARIABLES><SVCURRENTCOMPANY>${xmlEscape(
+    companyName
+  )}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="AppStockItems" ISMODIFY="No"><TYPE>StockItem</TYPE><NATIVEMETHOD>Name</NATIVEMETHOD><NATIVEMETHOD>Parent</NATIVEMETHOD><FILTER>AppGoodsFilter</FILTER></COLLECTION><SYSTEM TYPE="Formulae" NAME="AppGoodsFilter">$Parent = "Goods"</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  const text = await tallyPost(xml);
+  const items = [];
+  const re = /<STOCKITEM NAME="([^"]*)"/g;
+  let m;
+  while ((m = re.exec(text))) items.push({ name: decodeXmlEntities(m[1]) });
+  return items;
 }
 
 // ---- Ledger list + group tree (only called explicitly, one company) ----
@@ -238,12 +298,13 @@ function matchLedgersForGstin(gstin, ledgers, groupMap) {
 // NUMBERINGMETHOD = None, so Tally itself will not stop a duplicate -
 // this is the only guard.
 async function fetchExistingVoucherKeys(companyName, fromIso, toIso) {
+  const masters = getMasters(companyName);
   const fromT = fromIso.replace(/-/g, '');
   const toT = toIso.replace(/-/g, '');
   const xml = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>Voucher Register</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>${xmlEscape(
     companyName
   )}</SVCURRENTCOMPANY><SVFROMDATE TYPE="Date">${fromT}</SVFROMDATE><SVTODATE TYPE="Date">${toT}</SVTODATE><VOUCHERTYPENAME>${xmlEscape(
-    MASTERS.voucherType
+    masters.voucherType
   )}</VOUCHERTYPENAME></STATICVARIABLES></DESC></BODY></ENVELOPE>`;
   const text = await tallyPost(xml);
   const keys = new Set();
@@ -256,12 +317,13 @@ async function fetchExistingVoucherKeys(companyName, fromIso, toIso) {
 // ---- Voucher XML ------------------------------------------------------
 
 function buildVoucherXml(row, companyName) {
+  const masters = getMasters(companyName);
   const c = row.computed;
-  const tcsLedger = pickTcsLedger(row.invoiceDate);
+  const tcsLedger = pickTcsLedger(row.invoiceDate, masters);
   const totalRounded = c.total.toFixed(2);
   const taxable = c.taxable.toFixed(2);
-  const qtyStr = `${row.qty} ${MASTERS.unit}`;
-  const rateStr = `${row.rate}/${MASTERS.unit}`;
+  const qtyStr = `${row.qty} ${masters.unit}`;
+  const rateStr = `${row.rate}/${masters.unit}`;
 
   // c.roundOff = total - preRound (positive when the whole-rupee total was
   // rounded UP from the exact sum, negative when rounded DOWN). For the
@@ -276,7 +338,7 @@ function buildVoucherXml(row, companyName) {
     Math.abs(c.roundOff) > 0.001
       ? `
    <LEDGERENTRIES.LIST>
-    <LEDGERNAME>${xmlEscape(MASTERS.roundOffLedger)}</LEDGERNAME>
+    <LEDGERNAME>${xmlEscape(masters.roundOffLedger)}</LEDGERNAME>
     <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
     <AMOUNT>${(-c.roundOff).toFixed(2)}</AMOUNT>
    </LEDGERENTRIES.LIST>`
@@ -291,10 +353,10 @@ function buildVoucherXml(row, companyName) {
   </REQUESTDESC>
   <REQUESTDATA>
    <TALLYMESSAGE xmlns:UDF="TallyUDF">
-    <VOUCHER VCHTYPE="${xmlEscape(MASTERS.voucherType)}" ACTION="Create" OBJVIEW="Invoice Voucher View">
+    <VOUCHER VCHTYPE="${xmlEscape(masters.voucherType)}" ACTION="Create" OBJVIEW="Invoice Voucher View">
      <DATE>${row.invoiceDateTally}</DATE>
      <REFERENCEDATE>${row.invoiceDateTally}</REFERENCEDATE>
-     <VOUCHERTYPENAME>${xmlEscape(MASTERS.voucherType)}</VOUCHERTYPENAME>
+     <VOUCHERTYPENAME>${xmlEscape(masters.voucherType)}</VOUCHERTYPENAME>
      <VOUCHERNUMBER>${xmlEscape(row.invoiceNo)}</VOUCHERNUMBER>
      <REFERENCE>${xmlEscape(row.invoiceNo)}</REFERENCE>
      <PARTYLEDGERNAME>${xmlEscape(row.ledgerName)}</PARTYLEDGERNAME>
@@ -304,19 +366,19 @@ function buildVoucherXml(row, companyName) {
      <VCHENTRYMODE>Item Invoice</VCHENTRYMODE>
      <NARRATION>${xmlEscape(row.vehicleNo)}</NARRATION>
      <ALLINVENTORYENTRIES.LIST>
-      <STOCKITEMNAME>${xmlEscape(MASTERS.stockItem)}</STOCKITEMNAME>
+      <STOCKITEMNAME>${xmlEscape(row.stockItemName || masters.stockItem)}</STOCKITEMNAME>
       <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
       <RATE>${rateStr}</RATE>
       <ACTUALQTY>${qtyStr}</ACTUALQTY>
       <BILLEDQTY>${qtyStr}</BILLEDQTY>
       <AMOUNT>-${taxable}</AMOUNT>
       <ACCOUNTINGALLOCATIONS.LIST>
-       <LEDGERNAME>${xmlEscape(MASTERS.purchaseLedger)}</LEDGERNAME>
+       <LEDGERNAME>${xmlEscape(masters.purchaseLedger)}</LEDGERNAME>
        <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
        <AMOUNT>-${taxable}</AMOUNT>
       </ACCOUNTINGALLOCATIONS.LIST>
       <BATCHALLOCATIONS.LIST>
-       <GODOWNNAME>${xmlEscape(MASTERS.godown)}</GODOWNNAME>
+       <GODOWNNAME>${xmlEscape(masters.godown)}</GODOWNNAME>
        <BATCHNAME>Primary Batch</BATCHNAME>
        <AMOUNT>-${taxable}</AMOUNT>
        <ACTUALQTY>${qtyStr}</ACTUALQTY>
@@ -334,12 +396,12 @@ function buildVoucherXml(row, companyName) {
       </BILLALLOCATIONS.LIST>
      </LEDGERENTRIES.LIST>
      <LEDGERENTRIES.LIST>
-      <LEDGERNAME>${xmlEscape(MASTERS.cgstLedger)}</LEDGERNAME>
+      <LEDGERNAME>${xmlEscape(masters.cgstLedger)}</LEDGERNAME>
       <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
       <AMOUNT>-${c.cgst.toFixed(2)}</AMOUNT>
      </LEDGERENTRIES.LIST>
      <LEDGERENTRIES.LIST>
-      <LEDGERNAME>${xmlEscape(MASTERS.sgstLedger)}</LEDGERNAME>
+      <LEDGERNAME>${xmlEscape(masters.sgstLedger)}</LEDGERNAME>
       <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
       <AMOUNT>-${c.sgst.toFixed(2)}</AMOUNT>
      </LEDGERENTRIES.LIST>
@@ -383,6 +445,8 @@ function sleep(ms) {
 
 window.Tally = {
   MASTERS,
+  MASTERS_DGRPL,
+  getMasters,
   getConfig,
   fetchCompanyList,
   probeLedgerExists,
@@ -390,6 +454,7 @@ window.Tally = {
   probeVoucherTypeExists,
   checkRequiredMasters,
   fetchLedgers,
+  fetchStockItems,
   fetchGroups,
   classifyLedger,
   matchLedgersForGstin,

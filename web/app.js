@@ -7,6 +7,7 @@ let CONFIG = null;
 let bills = [];
 let nextId = 1;
 let ledgersCache = null; // { ledgers, groupMap }
+let stockItemsCache = null; // [{name}]
 let mastersOk = null; // null = unknown, true/false after a check
 
 const STATUS_LABEL = {
@@ -50,7 +51,12 @@ async function init() {
   const badge = document.getElementById('envBadge');
   badge.textContent = CONFIG.environment;
   badge.className = 'env-badge ' + (CONFIG.environment === 'SERVER' ? 'server' : 'local');
-  populateCompanySelect([CONFIG.companyName], CONFIG.companyName);
+  // Second real company confirmed open in Tally alongside the configured
+  // default (via "Test connection", which repopulates this with whatever
+  // Tally actually reports live) - listed up front so switching to it
+  // doesn't require running Test connection first.
+  const knownCompanies = [CONFIG.companyName, 'Delta Global Resources Private Limited 2025-26'];
+  populateCompanySelect(Array.from(new Set(knownCompanies)), CONFIG.companyName);
 
   document.getElementById('companySelect').addEventListener('change', onCompanyChanged);
   document.getElementById('btnTestConnection').addEventListener('click', testConnection);
@@ -100,18 +106,33 @@ function onCompanyChanged(e) {
   if (!newCompany || newCompany === CONFIG.companyName) return;
   const old = CONFIG.companyName;
   CONFIG.companyName = newCompany;
-  // Masters/ledger state is company-specific - anything checked against the
-  // old company doesn't apply to the new one.
+
+  // Every piece of state below was checked against (or fetched from) the
+  // OLD company - none of it carries over. Ledgers, stock items, masters,
+  // and any per-row Tally-side validation (ledger/stock existence,
+  // duplicate check) all have to be redone against the new company before
+  // anything can be sent.
   ledgersCache = null;
+  stockItemsCache = null;
   mastersOk = null;
   document.getElementById('mastersResult').innerHTML = '';
   document.getElementById('ledgersDatalist').innerHTML = '';
+  document.getElementById('stockItemsDatalist').innerHTML = '';
+
   for (const row of bills) {
     row.ledgerCandidates = [];
     row.manualLedgerEntry = true;
+    row.stockItemName = Tally.getMasters(CONFIG.companyName).stockItem;
+    row.errors = [];
+    if (row.status === 'ready' || row.status === 'duplicate' || row.status === 'failed') {
+      row.status = 'needs_review';
+    }
   }
   renderTable();
-  log(`Switched active company: "${old}" -> "${newCompany}". Re-run "Check required masters" and "Load ledgers" for it before sending.`, 'info');
+  log(
+    `Switched active company: "${old}" -> "${newCompany}". Every row was reset to "needs review" - re-run "Check required masters", "Load ledgers & stock items", and preflight for the new company before sending anything.`,
+    'info'
+  );
 }
 
 async function testConnection() {
@@ -202,6 +223,18 @@ async function loadLedgers() {
   }
 
   ledgersCache = { ledgers, groupMap };
+
+  log('Loading stock items from ' + CONFIG.companyName + ' …');
+  try {
+    const stockItems = await Tally.fetchStockItems(CONFIG.companyName);
+    stockItemsCache = stockItems;
+    const stockDatalist = document.getElementById('stockItemsDatalist');
+    stockDatalist.innerHTML = stockItems.map((s) => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+    log(`Loaded ${stockItems.length} stock items.`, 'ok');
+  } catch (e) {
+    log('Failed to load stock items: ' + e.message + ' - the Goods column still works via free-text entry.', 'err');
+  }
+
   rematchAllRows();
   renderTable();
 }
@@ -246,6 +279,7 @@ function makeRow(fileName) {
     ledgerName: '',
     ledgerCandidates: [],
     manualLedgerEntry: false,
+    stockItemName: Tally.getMasters(CONFIG.companyName).stockItem,
     warnings: [],
     errors: [],
     tallyResult: null,
@@ -543,6 +577,36 @@ function renderLedgerCell(row, locked) {
   </select>`;
 }
 
+// A real <select> of every Tally stock item once loaded (no GSTIN-style
+// candidate matching here - any bill could legitimately be any stocked
+// coal/iron/ore variant, not just the "Imported Steam Coal - TR" default),
+// falling back to free-text entry (with datalist suggestions) only when
+// the stock item list hasn't been loaded yet.
+function renderStockItemCell(row, locked) {
+  if (!stockItemsCache || stockItemsCache.length === 0) {
+    return `<input class="wide" list="stockItemsDatalist" data-id="${row.id}" data-field="stockItemName" value="${escapeHtml(
+      row.stockItemName
+    )}" placeholder="load stock items above first…" ${locked ? 'disabled' : ''} />`;
+  }
+
+  const currentInList = stockItemsCache.some((s) => s.name === row.stockItemName);
+  // The row's current value might not be in the loaded list (typed
+  // manually before load, or the list changed since) - offer it anyway so
+  // a valid-but-unlisted choice never gets silently discarded.
+  const extraOption =
+    !currentInList && row.stockItemName
+      ? `<option value="${escapeHtml(row.stockItemName)}" selected>${escapeHtml(row.stockItemName)} (not in list)</option>`
+      : '';
+
+  const options = stockItemsCache
+    .map((s) => `<option value="${escapeHtml(s.name)}" ${s.name === row.stockItemName ? 'selected' : ''}>${escapeHtml(s.name)}</option>`)
+    .join('');
+
+  return `<select class="wide" data-id="${row.id}" data-field="stockItemName" ${locked ? 'disabled' : ''}>
+    ${extraOption}${options}
+  </select>`;
+}
+
 function skeletonCell(extraClass) {
   return `<td class="${extraClass || ''}"><span class="skeleton"></span></td>`;
 }
@@ -564,6 +628,7 @@ function renderRow(row) {
     <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}${aiPendingTag}</td>
     ${skeletonCell('col-supplier')}
     ${skeletonCell('col-ledger')}
+    ${skeletonCell('col-goods')}
     ${skeletonCell('col-invno')}
     ${skeletonCell()}
     ${skeletonCell('col-vehicle')}
@@ -581,7 +646,7 @@ function renderRow(row) {
   if (row.status === 'error') {
     return `<tr data-row-id="${row.id}" class="${row.expanded ? 'row-expanded' : ''}">
     <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}</td>
-    <td colspan="9" class="extraction-failed-cell">Extraction failed - expand for details</td>
+    <td colspan="10" class="extraction-failed-cell">Extraction failed - expand for details</td>
     <td class="col-flags"></td>
     <td class="col-status"><span class="status-dot ${row.status}" title="${escapeHtml(statusLabel)}"></span></td>
     <td class="col-select"><input class="row-select" type="checkbox" data-id="${row.id}" data-action="select-row" ${row.selected ? 'checked' : ''} /></td>
@@ -623,6 +688,7 @@ function renderRow(row) {
     <td class="col-file small-dim" title="${escapeHtml(row.fileName)}">${escapeHtml(row.fileName)}${ocrTag}</td>
     ${supplierText ? ellipsisCell(supplierText, 'col-supplier') : '<td><span class="diff-flag">unknown</span></td>'}
     ${ellipsisCell(row.ledgerName, 'col-ledger')}
+    ${ellipsisCell(row.stockItemName, 'col-goods')}
     ${ellipsisCell(row.invoiceNo, 'col-invno')}
     <td>${row.invoiceDate ? fmtDateDisplay(row.invoiceDate) : '<span class="small-dim">—</span>'}</td>
     ${ellipsisCell(row.vehicleNo, 'col-vehicle')}
@@ -650,7 +716,7 @@ function renderDetailRow(row) {
       : '';
 
   return `<tr class="detail-row" data-detail-for="${row.id}">
-    <td colspan="12">
+    <td colspan="13">
       <div class="detail-content-wrap">
         <div class="detail-top-context">
           <div class="context-supplier">${escapeHtml(row.supplierLabel || 'Supplier not identified')} <span class="small-dim">${escapeHtml(row.supplierGSTIN) || 'GSTIN not detected'}</span> ${row.extractionMethod === 'ocr' ? '<span class="ocr-tag">OCR</span>' : row.extractionMethod === 'ai' ? '<span class="ai-tag">AI</span>' : row.aiStatus === 'failed' ? '<span class="ai-tag ai-tag-failed">AI failed</span>' : '<span class="small-dim">(digital text)</span>'}</div>
@@ -663,6 +729,10 @@ function renderDetailRow(row) {
               <div class="field field-wide">
                 <label class="detail-label">Ledger</label>
                 ${renderLedgerCell(row, locked)}
+              </div>
+              <div class="field field-wide">
+                <label class="detail-label">Goods</label>
+                ${renderStockItemCell(row, locked)}
               </div>
               <div class="field">
                 <label class="detail-label">Invoice No</label>
@@ -813,6 +883,7 @@ function onTableClick(e) {
 function validateRowLocally(row) {
   const errors = [];
   if (!row.ledgerName) errors.push('Ledger not set.');
+  if (!row.stockItemName) errors.push('Goods (stock item) not set.');
   if (!row.invoiceNo) errors.push('Invoice number missing.');
   if (!row.invoiceDate) errors.push('Invoice date missing/invalid.');
   if (!row.qty || row.qty <= 0) errors.push('Quantity missing.');
@@ -859,9 +930,26 @@ async function runPreflight() {
     if (row.errors.length === 0) locallyValid.push(row);
   }
 
-  // per-row ledger existence, one request at a time
-  statusEl.textContent = `Checking ${locallyValid.length} ledger name(s) in Tally…`;
+  // Within-batch duplicate check - the Tally-side check further down can't
+  // catch this: if the same bill is uploaded twice (or otherwise produces
+  // two rows with the same invoice number) before either has ever been
+  // sent, neither invoice number exists in Tally yet, so that check alone
+  // would let both through. Checked against ALL rows, not just this
+  // batch's candidates, so a duplicate of an already-sent row is caught
+  // too. Both rows sharing a number are flagged, not just the second one -
+  // either could be the wrong one, so neither is silently trusted.
   for (const row of locallyValid) {
+    const clash = bills.find((b) => b !== row && b.invoiceNo && b.invoiceNo === row.invoiceNo);
+    if (clash) {
+      row.status = 'duplicate';
+      row.errors.push(`Invoice "${row.invoiceNo}" is already used by another row in this table (${clash.fileName}) - remove one before sending.`);
+    }
+  }
+  const readyForTallyChecks = locallyValid.filter((r) => r.errors.length === 0);
+
+  // per-row ledger existence, one request at a time
+  statusEl.textContent = `Checking ${readyForTallyChecks.length} ledger name(s) in Tally…`;
+  for (const row of readyForTallyChecks) {
     try {
       const r = await Tally.probeLedgerExists(CONFIG.companyName, row.ledgerName);
       if (!r.exists) {
@@ -873,7 +961,22 @@ async function runPreflight() {
     }
   }
 
-  const stillValid = locallyValid.filter((r) => r.errors.length === 0);
+  // Per-row stock item existence, same as ledger - it's no longer a single
+  // shared master now that Goods is per-row selectable.
+  statusEl.textContent = `Checking ${readyForTallyChecks.length} stock item name(s) in Tally…`;
+  for (const row of readyForTallyChecks) {
+    try {
+      const r = await Tally.probeStockItemExists(CONFIG.companyName, row.stockItemName);
+      if (!r.exists) {
+        row.errors.push(`Stock item "${row.stockItemName}" not found in Tally - name must match exactly.`);
+      }
+      await Tally.sleep(150);
+    } catch (e) {
+      row.errors.push('Stock item check failed: ' + e.message);
+    }
+  }
+
+  const stillValid = readyForTallyChecks.filter((r) => r.errors.length === 0);
 
   // duplicate check across the whole batch's date span, one request
   if (stillValid.length > 0) {
